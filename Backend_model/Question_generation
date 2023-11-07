@@ -1,0 +1,222 @@
+from textwrap3 import wrap
+import torch
+from transformers import T5ForConditionalGeneration,T5Tokenizer
+import random
+import numpy as np
+from nltk.corpus import wordnet as wn
+from nltk.tokenize import sent_tokenize
+from nltk.corpus import stopwords
+import string
+import pke
+import traceback
+from flashtext import KeywordProcessor
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+def postprocesstext (content):
+  final=""
+  for sent in sent_tokenize(content):
+    sent = sent.capitalize()
+    final = final +" "+sent
+  return final
+
+def summarizer(text,model,tokenizer):
+  text = text.strip().replace("\n"," ")
+  text = "summarize: "+text
+  # print (text)
+  max_len = 512
+  encoding = tokenizer.encode_plus(text,max_length=max_len, pad_to_max_length=False,truncation=True, return_tensors="pt").to(device)
+
+  input_ids, attention_mask = encoding["input_ids"], encoding["attention_mask"]
+
+  outs = model.generate(input_ids=input_ids,
+                                  attention_mask=attention_mask,
+                                  early_stopping=True,
+                                  num_beams=20,
+                                  num_return_sequences=10,
+                                  no_repeat_ngram_size=2,
+                                  min_length = 100,
+                                  max_length=300)
+
+  dec = [tokenizer.decode(ids,skip_special_tokens=True) for ids in outs]
+  summary = dec[0]
+  summary = postprocesstext(summary)
+  summary= summary.strip()
+
+  return summary
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def get_nouns_multipartite(content):
+    out=[]
+    try:
+        extractor = pke.unsupervised.MultipartiteRank()
+        extractor.load_document(input=content,language='en')
+        #    not contain punctuation marks or stopwords as candidates.
+        pos = {'PROPN','NOUN','NUM'}
+        #pos = {'PROPN','NOUN'}
+        stoplist = list(string.punctuation)
+        stoplist += ['-lrb-', '-rrb-', '-lcb-', '-rcb-', '-lsb-', '-rsb-']
+        stoplist += stopwords.words('english')
+        # extractor.candidate_selection(pos=pos, stoplist=stoplist)
+        extractor.candidate_selection(pos=pos)
+        # 4. build the Multipartite graph and rank candidates using random walk,
+        #    alpha controls the weight adjustment mechanism, see TopicRank for
+        #    threshold/method parameters.
+        extractor.candidate_weighting(alpha=1.1,
+                                      threshold=0.75,
+                                      method='average')
+        keyphrases = extractor.get_n_best(n=15)
+
+
+        for val in keyphrases:
+            out.append(val[0])
+    except:
+        out = []
+        traceback.print_exc()
+
+    return out
+
+def get_keywords(originaltext,summarytext):
+    keywords = get_nouns_multipartite(originaltext)
+    print ("keywords unsummarized: ",keywords)
+    keyword_processor = KeywordProcessor()
+    for keyword in keywords:
+      keyword_processor.add_keyword(keyword)
+
+    keywords_found = keyword_processor.extract_keywords(summarytext)
+    keywords_found = list(set(keywords_found))
+    print ("keywords_found in summarized: ",keywords_found)
+
+    important_keywords =[]
+    for keyword in keywords:
+      if keyword in keywords_found:
+        important_keywords.append(keyword)
+
+    return important_keywords[:10]
+
+def get_question(context,answer,model,tokenizer):
+  text = "context: {} answer: {}".format(context,answer)
+  encoding = tokenizer.encode_plus(text,max_length=384, pad_to_max_length=False,truncation=True, return_tensors="pt").to(device)
+  input_ids, attention_mask = encoding["input_ids"], encoding["attention_mask"]
+
+  outs = model.generate(input_ids=input_ids,
+                                  attention_mask=attention_mask,
+                                  early_stopping=True,
+                                  num_beams=5,
+                                  num_return_sequences=1,
+                                  no_repeat_ngram_size=2,
+                                  max_length=72)
+
+
+  dec = [tokenizer.decode(ids,skip_special_tokens=True) for ids in outs]
+
+
+  Question = dec[0].replace("question:","")
+  Question= Question.strip()
+  return Question
+
+
+ip1 = """The official Sanskrit name for India is Bharat. 
+The Aryan worshippers referred to the river Indus as the Sindhu. 
+The Persian invaders converted it into Hindu. one of the most ancient and living civilizations. 
+The number system was invented by Indians. Aryabhatta was the scientist who invented the 'digit zero'. 
+The ‘place value system’ and the ‘decimal system’ were developed in 100 BC in India. 
+The 'University of Nalanda' built in the 4th century was one of the greatest achievements of ancient India in the field of education.
+Ayurveda is the earliest "school-of-medicine" known to mankind. 
+The 'father of medicine', Charaka, consolidated Ayurveda 2500 years ago. 
+The value of “pi” was first calculated by the Indian Mathematician Budhayana, and he explained the concept of what is known as the Pythagorean Theorem. 
+Sushruta is regarded as the father of surgery."""
+
+ip2 = """The sun, the moon and all those objects shining in the night sky are called celestial-bodies. Some celestial-bodies are very big and hot. They are made up of gases.
+Stars are celestial-bodies which have their own heat and light. The sun is a star.
+Constellations: In the night sky, various patterns are formed by different groups of stars called constellations. Ursa Major or Big Bear is one such constellation.
+One of the most easily recognisable constellations is the Saptarishi (Saptaseven, rishi-sages). It is a group of seven stars that forms a part of Ursa Major Constellation.
+In ancient times, people used to determine directions during the night with the help of stars. The North Star indicates the north direction. It is also called the Pole Star. It always remains in the same position in the sky.
+Planets are celestial bodies that do not have their own heat and light. They are lit by the light of the stars. The word ‘planet’ comes from the Greek word “Planetai”, which means ‘wanderers’.
+The earth on which we live is a planet. It gets all its heat and light from the sun. The moon that we see in the sky is a satellite. It is a companion of our earth and moves around it. Like our earth, there are seven other planets that get heat and light from the sun. Some of them have their moons too.
+"""
+ip3 = """human-heart is roughly the size of a large fist.
+The heart weighs 9 to 12 ounces (250 and 350 grams).
+The heart beats about 100000 times in a day.
+Newborns hearts beat faster than adult hearts.
+The heart pumps about 6 quarts (5.7 litres) of blood throughout the body.
+The heart is located in the center of the chest, usually pointing slightly left.
+Because heart has its own electrical impulse, it can continue to beat even when separated from the body, as long as it has an adequate supply of oxygen.
+The “thump-thump” of a heartbeat is the sound made by the 4 valves of the heart closing.
+"""
+
+n = 1
+if n == 1:
+  text = ip1
+elif n == 2:
+  text = ip2
+elif n == 3:
+  text = ip3
+
+text1 = ""
+for wrp in wrap(text, 160):
+  text1 = text1 + wrp
+  print (wrp)
+print ("\n")
+
+summary_model = T5ForConditionalGeneration.from_pretrained('t5-base')
+summary_tokenizer = T5Tokenizer.from_pretrained('t5-base')
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+summary_model = summary_model.to(device)
+
+set_seed(42)
+
+summarized_text = summarizer(text1,summary_model,summary_tokenizer)
+
+print ("\noriginal Text >>")
+for wrp in wrap(text1, 160):
+  print (wrp)
+print ("\n")
+
+print ("Summarized Text >>")
+for wrp in wrap(summarized_text, 160):
+  print (wrp)
+print ("\n")
+
+imp_keywords = get_keywords(text,summarized_text)
+print (imp_keywords)
+
+question_model = T5ForConditionalGeneration.from_pretrained('ramsrigouthamg/t5_squad_v1')
+question_tokenizer = T5Tokenizer.from_pretrained('ramsrigouthamg/t5_squad_v1')
+question_model = question_model.to(device)
+
+for wrp in wrap(summarized_text, 160):
+  print (wrp)
+print ("\n")
+
+def KeyW(n):
+  Q = {}
+  if n == 1:
+    print("processing")
+  for answer in imp_keywords:
+    ques = get_question(summarized_text,answer,question_model,question_tokenizer)
+    print (ques)
+    print (answer.capitalize())
+    print ("\n")
+    i=1
+    Q[i] = {answer : ques}
+    i= i+1
+  return Q
+
+@app.route('/', methods = ['GET'])
+def Qlist():
+    result = {}
+    d = {}
+    result = KeyW(n)
+    d['output'] = result
+    return jsonify(d)
+  
+if __name__ == "__main__":
+    app.run()
